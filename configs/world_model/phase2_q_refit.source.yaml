@@ -1,0 +1,106 @@
+# Q-head and contact-head refit after the dynamics refit (TurnOnSinkFaucet).
+#
+# Fitted Q evaluation with clipped double Q on the logged trajectories and the
+# targeted rollouts; the shared DiT stays frozen. The contact head is trained in
+# the same stage with binary cross-entropy against the logged contact at the
+# end of each chunk.
+
+common:
+  num_latent_frames: 3
+  video_height: 256
+  video_width: 256
+  action_chunk_length: 8
+  action_dim: 12
+  state_dim: 17
+
+dataset:
+  tasks:
+    - task_id: "TurnOnSinkFaucet"
+      t5_embedding_path: "datasets/assets/t5_embedding/prompts/robocasa/TurnOnSinkFaucet.pt"
+      data_paths:
+        - "datasets/origin/success"
+        - "datasets/origin/failure"
+        - "datasets/targeted_rollouts/success"
+        - "datasets/targeted_rollouts/failure"
+
+  future_offset: 8
+  action_stride: 1
+  max_samples: null
+
+  use_contact: true
+  left_contact_key: "observation.contact.left"
+  right_contact_key: "observation.contact.right"
+  require_contact: true
+  contact_sidecar_name: "contact_features.npy"
+  terminal_outcomes:
+    - success
+    - failure
+    - success
+    - failure
+
+  viva_cache_dir: null
+
+model:
+  wan:
+    config_path: "datasets/assets/wan/Wan2.2-TI2V-5B"
+    checkpoint_path: "datasets/assets/wan/Wan2.2-TI2V-5B"
+    vae_path: "datasets/assets/wan/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+    precision: "bfloat16"
+    num_layers: 30
+
+  action_context_hidden: 512
+  action_time_hidden: 512
+  state_context_hidden: 512
+  state_time_hidden: 512
+
+  q_dit_n_blocks: 15
+  state_proj_dim: 256
+  action_embed_dim: 256
+  q_hidden_dim: 512
+  q_placeholder_timestep: 999
+  q_placeholder_type: "randn"
+
+training:
+  stage: 2
+  freeze_dit_in_stage2: true
+
+  batch_size: 8
+  max_steps: 100000
+  learning_rate: 4.0e-5
+  weight_decay: 0.01
+  warmup_steps: 500
+  gradient_accumulation_steps: 1
+  grad_clip_norm: 1.0
+  use_amp: true
+
+  loss_weight_future_state: 1.0
+  loss_weight_future_cam: 1.0
+  loss_weight_q: 1.0
+  loss_weight_contact: 1.0
+
+  gamma: 0.99
+  alpha: 1.0
+  beta_succ: 1.0
+  beta_fail: 1.0
+  tau_polyak: 0.005
+
+system:
+  checkpoint_dir: "outputs/turn_on_sink_faucet/checkpoints/q_refit"
+  log_level: "INFO"
+  log_interval: 20
+  save_interval: 5000
+  num_workers: 8
+  pin_memory: true
+
+logging:
+  report_to: [tensorboard, wandb]
+  tensorboard_log_dir: "./tensorboard/q_refit"
+  run_name: "q-refit"
+  wandb_project: "world-model-rl"
+  wandb_entity: null
+  wandb_mode: "online"
+
+resume:
+  checkpoint_path: "checkpoints/world_model_after_online_update"
+  reset_step: true
+  only_model: true

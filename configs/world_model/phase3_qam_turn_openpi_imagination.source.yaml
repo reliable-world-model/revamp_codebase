@@ -1,0 +1,149 @@
+# Policy improvement for TurnOnSinkFaucet with OpenPI pi0: QAM on
+# reliability-weighted imagined rollouts. Rollouts start at logged real states
+# and continue chunk by chunk until the reliability score exceeds tau or the
+# episode ends; each chunk's adjoint-matching loss is weighted by exp(-lambda r)
+# and the chunk that crosses tau is written to the trigger buffer.
+#
+# Entry point: revamp.stage3_qam.train_policy (via run_imagination_policy.py).
+
+common:
+  num_latent_frames: 3
+  video_height: 256
+  video_width: 256
+  action_chunk_length: 8
+  action_dim: 12
+  state_dim: 17
+
+dataset:
+  tasks:
+    - task_id: "TurnOnSinkFaucet"
+      t5_embedding_path: "datasets/assets/t5_embedding/prompts/robocasa/TurnOnSinkFaucet.pt"
+      # The 150 logged trajectories (100 successful, 50 failed) shared by the
+      # world model, the Q-head, and policy improvement.
+      data_paths:
+        - "datasets/origin/success"
+        - "datasets/origin/failure"
+  compute_state_stats: true
+  future_offset: 8
+  action_stride: 1
+  max_samples: null
+  use_contact: true
+  left_contact_key: "observation.contact.left"
+  right_contact_key: "observation.contact.right"
+  require_contact: true
+  contact_sidecar_name: "contact_features.npy"
+  terminal_outcomes: ["success", "failure"]
+
+model:
+  wan:
+    config_path: "datasets/assets/wan/Wan2.2-TI2V-5B"
+    checkpoint_path: "datasets/assets/wan/Wan2.2-TI2V-5B"
+    vae_path: "datasets/assets/wan/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+    precision: "bfloat16"
+    num_layers: 30
+
+  action_context_hidden: 512
+  action_time_hidden: 512
+  state_context_hidden: 512
+  state_time_hidden: 512
+  q_dit_n_blocks: 15
+  state_proj_dim: 256
+  action_embed_dim: 256
+  q_hidden_dim: 512
+  q_placeholder_timestep: 999
+  q_placeholder_type: "randn"
+
+  pi0:
+    openpi_root: "third_party/openpi"
+    config_name: "pi0_robocasa_turn_sft"
+    checkpoint_path: "checkpoints/openpi_pi0_turn"
+    prompt: "Turn on the sink faucet."
+
+    # OpenPI normalization stats are loaded from checkpoint_path/assets.
+    # Stage3 QAM samples come from dataset.tasks above, not from OpenPI demos.
+    num_flow_steps: 8
+    # OpenPI internally predicts [50, 32], RobocasaOutputs returns first 12
+    # action dims, and Stage 2 Q consumes the first 8 time steps.
+    q_action_horizon: 8
+    q_action_dim: 12
+
+training:
+  # World model with the fitted Q-head and contact head (refit after each round).
+  stage2_q_checkpoint: "checkpoints/stage2_q_initial"
+
+  # Per visible JAX device. Global batch = per_device_batch_size * jax.device_count().
+  per_device_batch_size: 8
+  max_steps: 5000
+  learning_rate: 1.0e-6
+  weight_decay: 0.01
+  grad_clip_norm: 1.0
+  # Policy adaptation: LoRA adapters (rank 32) on the action expert
+  # (OpenPI action_expert_variant = gemma_300m_lora); all other weights frozen.
+  trainable_regex: ".*lora.*"
+
+  lambda_q: 1
+  # grad_a Q flows through the action input only, not through frame generation.
+  q_detach_dit: true
+  # Reference-flow coefficient beta of the weighted policy objective.
+  reference_kl_weight: 0.5
+  # QAM sigma schedule sigma(t) = sqrt(2 * (1 - t + h) / (t + h)).
+  qam_sigma_schedule: "qam_sqrt"
+  # OpenPI uses t=1 for noise and t=0 for the final action; QAM uses the
+  # opposite convention for sigma.
+  qam_time_transform: "one_minus_t"
+  use_discrete_adjoint: true
+  adjoint_solver_steps: 4
+  qam_path_samples: 1
+
+  metric_ema_beta: 0.98
+
+imagination:
+  enabled: true
+  imag_weight: 0.25           # imagined chunks relative to the logged start chunk
+  max_chunks: 64              # rollouts also stop at the end of the logged episode
+  num_inference_steps: 8      # world-model flow steps per chunk
+  contact_threshold: 0.5      # contact-head probability -> next chunk's contact bit
+  trigger_dir: "outputs/turn_on_sink_faucet/triggers"
+  state_advance:              # controller output limits used to advance the proprioceptive state
+    pos: 0.05
+    rot: 0.5
+    base_lin: 0.0
+    base_yaw: 0.0
+    gripper_open: 0.04
+    gripper_closed: 0.0
+
+reliability:
+  calibration: "datasets/assets/reliability/calibration.json"         # w_intr, w_ext, tau, lambda
+  depth_anything3: "datasets/assets/reliability/depth_anything_3"
+  gripper_segmenter: "datasets/assets/reliability/gripper_segmenter.pt"
+  gripper_template: "datasets/assets/reliability/gripper_template.npy"
+  camera_calibration: "datasets/assets/reliability/cameras.json"
+  inverse_dynamics: "datasets/assets/reliability/inverse_dynamics.pt"
+  action_dim: 12
+
+system:
+  checkpoint_dir: "outputs/turn_on_sink_faucet/checkpoints/policy_improvement"
+  log_level: "INFO"
+  log_interval: 50
+  save_interval: 500
+  num_workers: 8
+  pin_memory: true
+  drop_last: true
+  persistent_workers: true
+  prefetch_factor: 4
+  # JAX is multithreaded; PyTorch DataLoader's default fork workers can
+  # deadlock after JAX initializes. Use spawn/forkserver when workers > 0.
+  multiprocessing_context: "spawn"
+  # Large camera payloads are sent over localhost; avoiding zip compression
+  # usually saves CPU time and keeps the JAX/OpenPI GPUs waiting less.
+  q_payload_compression: "uncompressed"
+  imag_server_url: "http://127.0.0.1:8766"
+  imag_payload_compression: "uncompressed"
+
+logging:
+  report_to: "wandb"
+  wandb_project: "world-model-rl"
+  wandb_entity: null
+  wandb_mode: null
+  tensorboard_log_dir: "./tensorboard/policy_improvement"
+  run_name: "policy-improvement-turn-openpi"
